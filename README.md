@@ -26,6 +26,8 @@ The goal is to support fast strategy development, debugging, and collaboration d
 ├── visualizer/
 ├── DataCapsules/
 │   └── ROUND1/
+├── OfficialLogs/
+│   └── Run1(137859)/
 ├── PROJECT_OVERVIEW.md
 ├── frankfurtHedgeHogs_imc3.py
 └── README.md
@@ -55,6 +57,33 @@ The visualizer (`visualizer/`) is a custom `matplotlib` + `pandas` dashboard for
 python3 -m visualizer.main dashboard --show
 ```
 
+### Launch With Official Run Overlay
+
+Use the official submission logs in `OfficialLogs/` to add your own trades, the official run order book, and the P&L/position summary:
+
+```bash
+python3 -m visualizer.main dashboard --show --logs OfficialLogs --run "Run1(137859)"
+```
+
+### Snapshot View
+
+Render a single order-book snapshot for a product/day/timestamp:
+
+```bash
+python3 -m visualizer.main snapshot --product ASH_COATED_OSMIUM --day 0 --timestamp 500000 --show
+```
+
+### Visualizer Controls
+
+Inside the live dashboard:
+
+- use the radio buttons or left/right arrow keys to switch products
+- use the `Layers`, `Depth`, and `Days` toggles on the left
+- drag on the top chart to zoom time
+- scroll to zoom time
+- hold `Shift` while scrolling to zoom price
+- double-click or press `r` to reset the zoom
+
 ## Strategy Summary (`trading.py`)
 
 Current implemented logic:
@@ -72,7 +101,7 @@ Both are structured for iterative extension as more products and signals are add
 Install dependencies from the repository root:
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 ## Usage
@@ -87,6 +116,18 @@ Run the visualizer:
 
 ```bash
 python3 -m visualizer.main dashboard --show
+```
+
+Run the visualizer with official logs:
+
+```bash
+python3 -m visualizer.main dashboard --show --logs OfficialLogs --run "Run1(137859)"
+```
+
+Render a snapshot without opening the full dashboard:
+
+```bash
+python3 -m visualizer.main snapshot --product INTARIAN_PEPPER_ROOT --day 1 --timestamp 99900 --show
 ```
 
 ## Current Limitations / Next Steps
