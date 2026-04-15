@@ -8,7 +8,7 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter, MaxNLocator
-from matplotlib.widgets import Button, CheckButtons, RadioButtons, SpanSelector
+from matplotlib.widgets import Button, CheckButtons, RadioButtons
 
 from visualizer.analytics import PRICE_LEVELS, add_order_book_features, aggregate_trade_volume, infer_trade_aggressor
 from visualizer.data_loader import build_run_payload
@@ -110,7 +110,10 @@ def _apply_day_ticks(ax, frame: pd.DataFrame) -> None:
 
     boundaries = _day_boundaries(frame)
     tick_positions = ((boundaries["min_timestamp"] + boundaries["max_timestamp"]) / 2.0).tolist()
-    tick_labels = [f"Day {day}" for day in boundaries["day"].tolist()]
+    tick_labels = [
+        f"Day {day} (pre)" if day < 0 else f"Day {day}"
+        for day in boundaries["day"].tolist()
+    ]
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
 
@@ -158,6 +161,38 @@ def _shade_days(ax, frame: pd.DataFrame) -> None:
     for index, row in _day_boundaries(frame).iterrows():
         if index % 2 == 0:
             ax.axvspan(row["min_timestamp"], row["max_timestamp"], color=DAY_SHADE, alpha=0.85, zorder=0)
+
+
+def _annotate_day_labels(ax, frame: pd.DataFrame) -> None:
+    """Overlay 'Day N' / 'Day -1 (pre)' labels at the top of each day section."""
+    if frame.empty:
+        return
+
+    boundaries = _day_boundaries(frame)
+    for _, row in boundaries.iterrows():
+        day = int(row["day"])
+        x_pos = (row["min_timestamp"] + row["max_timestamp"]) / 2.0
+        if day < 0:
+            label = f"Day {day} (pre)"
+            color = "#9b2226"
+            style = "italic"
+        else:
+            label = f"Day {day}"
+            color = "#1f2937"
+            style = "normal"
+        ax.text(
+            x_pos,
+            0.985,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=8,
+            color=color,
+            style=style,
+            alpha=0.72,
+            zorder=5,
+        )
 
 
 def _clean_mid_price(frame: pd.DataFrame) -> pd.Series:
@@ -557,6 +592,8 @@ class ProductToggleDashboard:
         self.time_window = self.full_time_bounds
         self.price_zoom_scale = 1.0
         self._suspend_day_callback = False
+        self._drag_start_pixel = None
+        self._drag_start_window = None
 
         self.hover_points = pd.DataFrame()
         self.current_price_frame = pd.DataFrame()
@@ -618,9 +655,15 @@ class ProductToggleDashboard:
         _set_checkbox_fontsize(self.level_check, 9.5)
         self.level_check.on_clicked(self._on_level_toggled)
 
-        day_labels = [f"D{day}" for day in self.available_days]
+        day_labels = [f"Pre{abs(day)}" if day < 0 else f"D{day}" for day in self.available_days]
+        day_initial = [day > 0 for day in self.available_days]
+        # Hide negative days by default; if there are no positive days, show everything
+        if not any(day_initial):
+            day_initial = [True for _ in self.available_days]
+        self.day_visibility = {day: checked for day, checked in zip(self.available_days, day_initial)}
+        self.time_window = self._selected_day_bounds()
         day_ax = self.figure.add_axes([0.03, 0.13, 0.13, 0.11], facecolor="#f1f3f5")
-        self.day_check = CheckButtons(day_ax, day_labels, [True for _ in self.available_days])
+        self.day_check = CheckButtons(day_ax, day_labels, day_initial)
         _set_checkbox_fontsize(self.day_check, 9.5)
         self.day_check.on_clicked(self._on_day_toggled)
 
@@ -641,6 +684,7 @@ class ProductToggleDashboard:
         self.figure.canvas.mpl_connect("figure_leave_event", self._on_figure_leave)
         self.figure.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.figure.canvas.mpl_connect("button_press_event", self._on_button_press)
+        self.figure.canvas.mpl_connect("button_release_event", self._on_button_release)
 
         self.hover_annotation = None
         self.hover_vline = None
@@ -939,7 +983,10 @@ class ProductToggleDashboard:
         if self._suspend_day_callback:
             return
 
-        day = int(label.replace("D", ""))
+        if label.startswith("Pre"):
+            day = -int(label[3:])
+        else:
+            day = int(label[1:])
         self.day_visibility[day] = not self.day_visibility[day]
 
         if not any(self.day_visibility.values()):
@@ -1089,18 +1136,32 @@ class ProductToggleDashboard:
         self._apply_time_window()
 
     def _on_button_press(self, event) -> None:
-        if event.dblclick and event.inaxes in {self.price_ax, self.spread_ax, self.pnl_ax}:
+        if event.inaxes not in {self.price_ax, self.spread_ax, self.pnl_ax}:
+            return
+        if event.dblclick:
             self._reset_time_window_to_selected_days()
             self.price_zoom_scale = 1.0
             self._apply_time_window()
-
-    def _on_span_select(self, xmin: float, xmax: float) -> None:
-        if xmax - xmin <= 1.0:
             return
-        self.time_window = (min(xmin, xmax), max(xmin, xmax))
-        self._apply_time_window()
+        if event.button == 1 and event.x is not None:
+            self._drag_start_pixel = event.x
+            self._drag_start_window = self.time_window
+
+    def _on_button_release(self, event) -> None:
+        self._drag_start_pixel = None
+        self._drag_start_window = None
 
     def _on_mouse_move(self, event) -> None:
+        # Pan: left-button drag in any chart axis
+        if self._drag_start_pixel is not None and event.x is not None:
+            bbox = self.price_ax.get_window_extent()
+            ax_width = max(bbox.width, 1.0)
+            orig_lower, orig_upper = self._drag_start_window
+            data_delta = (self._drag_start_pixel - event.x) / ax_width * (orig_upper - orig_lower)
+            self.time_window = (orig_lower + data_delta, orig_upper + data_delta)
+            self._apply_time_window()
+            return
+
         if event.inaxes != self.price_ax or event.xdata is None or event.ydata is None or self.hover_points.empty:
             return
 
@@ -1172,6 +1233,7 @@ class ProductToggleDashboard:
         self.current_price_frame = product_prices
 
         _shade_days(self.price_ax, product_prices)
+        _annotate_day_labels(self.price_ax, product_prices)
         x_values = product_prices["global_timestamp"].to_numpy()
         clean_mid = _clean_mid_price(product_prices)
         smooth_mid = _smooth_mid_price(product_prices)
@@ -1534,15 +1596,7 @@ class ProductToggleDashboard:
             visible=False,
             zorder=6,
         )
-        self.span_selector = SpanSelector(
-            self.price_ax,
-            self._on_span_select,
-            "horizontal",
-            useblit=True,
-            props={"facecolor": "#74c0fc", "alpha": 0.18},
-            interactive=False,
-            drag_from_anywhere=False,
-        )
+        self.span_selector = None
 
     def render(self, product: str) -> None:
         self.current_product = product
