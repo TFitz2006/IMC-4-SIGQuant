@@ -132,7 +132,6 @@ python3 -m visualizer.main snapshot --product INTARIAN_PEPPER_ROOT --day 1 --tim
 
 ## Current Limitations / Next Steps
 
-- Strategy coverage is currently limited to two products.
 - Fair value models are intentionally simple and should be expanded with stronger signal inputs.
 - Risk controls, inventory management refinements, and execution robustness can be improved.
 - Visualizer workflows are local/manual; additional automation for repeatable analysis would help collaboration.
