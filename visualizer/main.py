@@ -21,8 +21,7 @@ from visualizer.data_loader import (
     DEFAULT_LOGS_ROOT,
     load_round1_data,
     discover_official_logs,
-    load_official_log,
-    recalculate_time_columns,
+    build_run_payload,
 )
 from visualizer.order_book import create_order_book_snapshot
 
@@ -47,6 +46,19 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"Path to official logs directory. Defaults to {DEFAULT_LOGS_ROOT} if it exists.",
+    )
+    dashboard_parser.add_argument(
+        "--output-log",
+        type=Path,
+        action="append",
+        dest="output_logs",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to an additional output log to include in the run dropdown. "
+            "Can be a single run directory (containing .json/.log files) or a root "
+            "directory of multiple run folders. Use multiple times to add more."
+        ),
     )
     dashboard_parser.add_argument(
         "--run",
@@ -87,56 +99,27 @@ def _write_figure(figure, output_path: Path | None, show: bool) -> None:
     plt.close(figure)
 
 
-def _align_time_to_prices(frame: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
-    aligned = frame.copy()
-    if aligned.empty:
-        return aligned
-
-    day_values = sorted(prices["day"].dropna().astype(int).unique().tolist())
-    day_order = {day: idx for idx, day in enumerate(day_values)}
-    day_span = int(prices.groupby("day")["timestamp"].max().max()) + 100
-
-    aligned["day_sequence"] = aligned["day"].map(day_order).astype(int)
-    aligned["global_timestamp"] = aligned["day_sequence"] * day_span + aligned["timestamp"]
-    aligned["day_label"] = aligned["day"].map(lambda day: f"Day {day}")
-    return aligned
-
-
-def _final_position_map(log_data: dict) -> dict[str, int]:
-    return {
-        row["symbol"]: int(row["quantity"])
-        for row in log_data.get("final_positions", [])
-        if row.get("symbol") != "XIRECS"
-    }
+def _resolve_output_log_dirs(path: Path) -> list[Path]:
+    """
+    Given a --output-log path, return the list of run directories it represents.
+    If the path itself contains .json/.log files it is treated as a single run dir.
+    Otherwise it is treated as a root containing multiple run sub-directories.
+    """
+    if not path.exists():
+        print(f"Warning: --output-log path does not exist: {path}")
+        return []
+    json_files = list(path.glob("*.json"))
+    log_files = list(path.glob("*.log"))
+    if json_files or log_files:
+        # The path itself is a run directory
+        return [path]
+    # Treat as a root directory and discover run sub-dirs
+    run_dirs = discover_official_logs(path)
+    if not run_dirs:
+        print(f"Warning: no run directories found under --output-log path: {path}")
+    return run_dirs
 
 
-def _build_official_run_payload(base_prices: pd.DataFrame, run_dir: Path, run_day: int = 1) -> dict:
-    log_data = load_official_log(run_dir, run_day=run_day)
-
-    merged_prices = base_prices.copy()
-    run_prices = log_data.get("run_prices")
-    if run_prices is not None and not run_prices.empty:
-        merged_prices = pd.concat([merged_prices, run_prices], ignore_index=True, sort=False)
-        merged_prices = recalculate_time_columns(merged_prices)
-        merged_prices = merged_prices.sort_values(["product", "day", "timestamp"]).reset_index(drop=True)
-
-    your_trades = log_data.get("your_trades", pd.DataFrame()).copy()
-    pnl_series = log_data.get("pnl_series", pd.DataFrame()).copy()
-    if not your_trades.empty:
-        your_trades = _align_time_to_prices(your_trades, merged_prices)
-    if not pnl_series.empty:
-        pnl_series = _align_time_to_prices(pnl_series, merged_prices)
-
-    return {
-        "name": run_dir.name,
-        "prices": merged_prices,
-        "your_trades": your_trades,
-        "pnl_series": pnl_series,
-        "final_profit": log_data.get("final_profit"),
-        "final_positions": _final_position_map(log_data),
-        "status": log_data.get("status", "UNKNOWN"),
-        "run_prices_count": 0 if run_prices is None else len(run_prices),
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -151,25 +134,33 @@ def main(argv: list[str] | None = None) -> int:
         selected_run_name = None
 
         logs_root = args.logs if args.logs else DEFAULT_LOGS_ROOT
+        all_run_dirs: list[Path] = []
         if Path(logs_root).exists():
-            run_dirs = discover_official_logs(logs_root)
-            if run_dirs:
-                for run_dir in run_dirs:
-                    official_runs[run_dir.name] = _build_official_run_payload(prices, run_dir, run_day=1)
+            all_run_dirs.extend(discover_official_logs(logs_root))
 
-                if args.run:
-                    matching = [name for name in official_runs if args.run in name]
-                    selected_run_name = matching[0] if matching else run_dirs[-1].name
-                else:
-                    selected_run_name = run_dirs[-1].name
+        for output_log_path in (args.output_logs or []):
+            extra_dirs = _resolve_output_log_dirs(output_log_path)
+            for d in extra_dirs:
+                if d not in all_run_dirs:
+                    all_run_dirs.append(d)
 
-                selected = official_runs[selected_run_name]
-                print(f"Loaded {len(official_runs)} official run folder(s). Selected: {selected_run_name} (as Day 1)")
-                print(
-                    f"  Added {selected['run_prices_count']} price rows | "
-                    f"Status: {selected['status']}, P&L: {selected['final_profit']:+,.2f}, "
-                    f"Your trades: {len(selected['your_trades'])}"
-                )
+        if all_run_dirs:
+            for run_dir in all_run_dirs:
+                official_runs[run_dir.name] = build_run_payload(prices, run_dir, run_day=1)
+
+            if args.run:
+                matching = [name for name in official_runs if args.run in name]
+                selected_run_name = matching[0] if matching else all_run_dirs[-1].name
+            else:
+                selected_run_name = all_run_dirs[-1].name
+
+            selected = official_runs[selected_run_name]
+            print(f"Loaded {len(official_runs)} run folder(s). Selected: {selected_run_name} (as Day 1)")
+            print(
+                f"  Added {selected['run_prices_count']} price rows | "
+                f"Status: {selected['status']}, P&L: {selected['final_profit']:+,.2f}, "
+                f"Your trades: {len(selected['your_trades'])}"
+            )
 
         if args.show:
             controller = launch_interactive_dashboard(

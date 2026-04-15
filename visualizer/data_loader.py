@@ -334,6 +334,64 @@ def _parse_algorithm_logs(logs: list[dict], day: int = 1) -> pd.DataFrame:
     return df
 
 
+def align_time_to_prices(frame: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    """Re-index a frame's global_timestamp to match the time scale of a prices DataFrame."""
+    aligned = frame.copy()
+    if aligned.empty:
+        return aligned
+
+    day_values = sorted(prices["day"].dropna().astype(int).unique().tolist())
+    day_order = {day: idx for idx, day in enumerate(day_values)}
+    day_span = int(prices.groupby("day")["timestamp"].max().max()) + 100
+
+    aligned["day_sequence"] = aligned["day"].map(day_order).astype(int)
+    aligned["global_timestamp"] = aligned["day_sequence"] * day_span + aligned["timestamp"]
+    aligned["day_label"] = aligned["day"].map(lambda day: f"Day {day}")
+    return aligned
+
+
+def build_run_payload(base_prices: pd.DataFrame, run_dir: Path | str, run_day: int = 1) -> dict:
+    """
+    Load a run directory and assemble a complete payload dict for the dashboard.
+
+    Returns a dict with keys: name, prices, your_trades, pnl_series, final_profit,
+    final_positions, status, run_prices_count.
+    """
+    run_path = Path(run_dir)
+    log_data = load_official_log(run_path, run_day=run_day)
+
+    merged_prices = base_prices.copy()
+    run_prices = log_data.get("run_prices")
+    if run_prices is not None and not run_prices.empty:
+        merged_prices = pd.concat([merged_prices, run_prices], ignore_index=True, sort=False)
+        merged_prices = recalculate_time_columns(merged_prices)
+        merged_prices = merged_prices.sort_values(["product", "day", "timestamp"]).reset_index(drop=True)
+
+    your_trades = log_data.get("your_trades", pd.DataFrame()).copy()
+    pnl_series = log_data.get("pnl_series", pd.DataFrame()).copy()
+    if not your_trades.empty:
+        your_trades = align_time_to_prices(your_trades, merged_prices)
+    if not pnl_series.empty:
+        pnl_series = align_time_to_prices(pnl_series, merged_prices)
+
+    final_positions = {
+        row["symbol"]: int(row["quantity"])
+        for row in log_data.get("final_positions", [])
+        if row.get("symbol") != "XIRECS"
+    }
+
+    return {
+        "name": run_path.name,
+        "prices": merged_prices,
+        "your_trades": your_trades,
+        "pnl_series": pnl_series,
+        "final_profit": log_data.get("final_profit"),
+        "final_positions": final_positions,
+        "status": log_data.get("status", "UNKNOWN"),
+        "run_prices_count": 0 if run_prices is None else len(run_prices),
+    }
+
+
 def load_all_official_logs(root: Path | str = DEFAULT_LOGS_ROOT) -> list[dict]:
     """Load all official logs from the logs directory."""
     run_dirs = discover_official_logs(root)

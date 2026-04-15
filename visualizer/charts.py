@@ -11,6 +11,7 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 from matplotlib.widgets import Button, CheckButtons, RadioButtons, SpanSelector
 
 from visualizer.analytics import PRICE_LEVELS, add_order_book_features, aggregate_trade_volume, infer_trade_aggressor
+from visualizer.data_loader import build_run_payload
 
 
 SIDE_COLORS = {
@@ -596,20 +597,14 @@ class ProductToggleDashboard:
         self.run_button = None
         self.run_option_buttons: list[Button] = []
         self.run_option_axes = []
-        if len(self.run_names) > 1:
-            run_button_ax = self.figure.add_axes([0.03, 0.69, 0.13, 0.035], facecolor="#f8f9fa")
-            self.run_button = Button(run_button_ax, _abbrev_run_name(self.selected_run or self.run_names[-1]))
-            self.run_button.label.set_fontsize(8.5)
-            self.run_button.on_clicked(self._toggle_run_dropdown)
 
-            for index, run_name in enumerate(self.run_names):
-                option_ax = self.figure.add_axes([0.03, 0.65 - index * 0.036, 0.13, 0.034], facecolor="#ffffff")
-                option_button = Button(option_ax, _abbrev_run_name(run_name))
-                option_button.label.set_fontsize(8.2)
-                option_button.on_clicked(lambda _event, selected=run_name: self._select_run_name(selected))
-                option_ax.set_visible(False)
-                self.run_option_axes.append(option_ax)
-                self.run_option_buttons.append(option_button)
+        # "+" add-run button — always present
+        add_run_ax = self.figure.add_axes([0.143, 0.69, 0.017, 0.035], facecolor="#e9ecef")
+        self.add_run_button = Button(add_run_ax, "+")
+        self.add_run_button.label.set_fontsize(11)
+        self.add_run_button.on_clicked(self._on_add_run_clicked)
+
+        self._rebuild_run_dropdown_controls()
 
         self.product_pnl = self._calculate_product_pnl()
 
@@ -630,8 +625,7 @@ class ProductToggleDashboard:
         self.day_check.on_clicked(self._on_day_toggled)
 
         self.figure.text(0.03, 0.895, "Product", fontsize=10, weight="bold", color="#212529")
-        if len(self.run_names) > 1:
-            self.figure.text(0.03, 0.735, "Run", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.735, "Run", fontsize=10, weight="bold", color="#212529")
         self.figure.text(0.03, 0.615, "Layers", fontsize=10, weight="bold", color="#212529")
         self.figure.text(0.03, 0.395, "Depth", fontsize=10, weight="bold", color="#212529")
         self.figure.text(0.03, 0.245, "Days", fontsize=10, weight="bold", color="#212529")
@@ -777,6 +771,121 @@ class ProductToggleDashboard:
             ("Marked PnL", marked_pnl),
         ]
         return [[metric, _format_metric_value(metric, value)] for metric, value in metrics]
+
+    def _rebuild_run_dropdown_controls(self) -> None:
+        """Create (or recreate) the run-selector button and dropdown option buttons."""
+        # Remove any existing run selector + options
+        if self.run_button is not None:
+            self.figure.delaxes(self.run_button.ax)
+            self.run_button = None
+        for ax in self.run_option_axes:
+            self.figure.delaxes(ax)
+        self.run_option_axes = []
+        self.run_option_buttons = []
+        self.run_dropdown_open = False
+
+        if not self.run_names:
+            return
+
+        # Selector button — narrower to leave room for the "+" button
+        run_button_ax = self.figure.add_axes([0.03, 0.69, 0.108, 0.035], facecolor="#f8f9fa")
+        self.run_button = Button(run_button_ax, _abbrev_run_name(self.selected_run or self.run_names[-1]))
+        self.run_button.label.set_fontsize(8.5)
+        self.run_button.on_clicked(self._toggle_run_dropdown)
+
+        for index, run_name in enumerate(self.run_names):
+            option_ax = self.figure.add_axes([0.03, 0.65 - index * 0.036, 0.13, 0.034], facecolor="#ffffff")
+            option_button = Button(option_ax, _abbrev_run_name(run_name))
+            option_button.label.set_fontsize(8.2)
+            option_button.on_clicked(lambda _event, selected=run_name: self._select_run_name(selected))
+            option_ax.set_visible(False)
+            self.run_option_axes.append(option_ax)
+            self.run_option_buttons.append(option_button)
+
+    def _on_add_run_clicked(self, _event) -> None:
+        """Open the native macOS folder picker in a background thread so the window stays live."""
+        import subprocess
+        import threading
+
+        def _pick() -> None:
+            try:
+                result = subprocess.run(
+                    [
+                        "osascript", "-e",
+                        'tell app "Finder" to POSIX path of '
+                        '(choose folder with prompt "Select run directory")',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode != 0:
+                    return
+                chosen = result.stdout.strip().rstrip("/")
+                if not chosen:
+                    return
+                # Schedule _add_run back on the main Tk thread so matplotlib is safe
+                try:
+                    self.figure.canvas.get_tk_widget().after(0, lambda: self._add_run(chosen))
+                except Exception:
+                    self._add_run(chosen)
+            except Exception as exc:
+                print(f"Directory picker failed: {exc}")
+
+        threading.Thread(target=_pick, daemon=True).start()
+
+    def _add_run(self, run_dir: str) -> None:
+        """Load a run directory, copy it into OfficialLogs/ if needed, and add to dropdown."""
+        import shutil
+        from pathlib import Path
+        from visualizer.data_loader import DEFAULT_LOGS_ROOT
+
+        run_path = Path(run_dir).expanduser().resolve()
+        if not run_path.exists():
+            print(f"Run directory not found: {run_path}")
+            return
+
+        run_name = run_path.name
+
+        # Copy into OfficialLogs/ if it lives elsewhere
+        logs_root = Path(DEFAULT_LOGS_ROOT).resolve()
+        dest_path = logs_root / run_name
+        if run_path != dest_path:
+            if not dest_path.exists():
+                logs_root.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(run_path, dest_path)
+                print(f"Copied '{run_name}' → {dest_path}")
+            run_path = dest_path
+
+        if run_name in self.official_runs:
+            self._select_run_name(run_name)
+            return
+
+        try:
+            payload = build_run_payload(self.base_prices, run_path, run_day=1)
+        except Exception as exc:
+            print(f"Failed to load run '{run_name}': {exc}")
+            return
+
+        self.official_runs[run_name] = payload
+        self.run_names = list(self.official_runs.keys())
+        self.selected_run = run_name
+
+        self._rebuild_run_dropdown_controls()
+        self.figure.canvas.draw_idle()
+
+        self._set_run_dropdown_visible(False)
+        self._set_data_state()
+        self.layer_visibility["Yours"] = self.has_official_data
+        self._reset_time_window_to_selected_days()
+        self.price_zoom_scale = 1.0
+        self._update_run_pnl_text()
+        self._hide_hover()
+        self.render(self.current_product)
+
+        print(f"Loaded run '{run_name}' | Status: {payload['status']}, "
+              f"P&L: {payload['final_profit']:+,.2f}, "
+              f"Your trades: {len(payload['your_trades'])}")
 
     def _on_product_label_selected(self, label: str) -> None:
         """Handle radio button click with abbreviated label."""
