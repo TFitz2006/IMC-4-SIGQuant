@@ -21,6 +21,12 @@ QUOTE_COLORS = {
     "bid": "#2b4c7e",
     "ask": "#c44536",
 }
+# Your algo's trades - bright, distinct colors
+YOUR_TRADE_COLORS = {
+    "buy": "#00ff88",   # Bright green
+    "sell": "#ff3366",  # Bright red/pink
+}
+PNL_COLOR = "#7c3aed"  # Purple for P&L line
 DAY_SHADE = "#f8f9fa"
 PRICE_COLOR = "#1f2937"
 SPREAD_COLOR = "#6a4c93"
@@ -28,6 +34,17 @@ SPREAD_FILL = "#d7c4f0"
 QUOTE_FILL = "#a8dadc"
 MAX_QUOTE_POINTS_PER_SIDE = 18_000
 HOVER_NEIGHBORHOOD = 280
+
+# Abbreviations for long product names
+PRODUCT_ABBREV = {
+    "ASH_COATED_OSMIUM": "ASH_OSM",
+    "INTARIAN_PEPPER_ROOT": "PEPPER",
+}
+
+
+def _abbrev_product(name: str) -> str:
+    """Shorten product name for display."""
+    return PRODUCT_ABBREV.get(name, name[:10])
 
 
 def _ensure_list(values: Sequence[str | int] | None) -> list[str | int] | None:
@@ -430,6 +447,10 @@ class ProductToggleDashboard:
         trades: pd.DataFrame | None = None,
         products: Sequence[str] | None = None,
         days: Sequence[int] | None = None,
+        your_trades: pd.DataFrame | None = None,
+        pnl_series: pd.DataFrame | None = None,
+        final_profit: float | None = None,
+        final_positions: dict[str, int] | None = None,
     ) -> None:
         plt.style.use("seaborn-v0_8-whitegrid")
         self.filtered_prices, self.filtered_trades, self.trade_volume, self.product_names = _prepare_dashboard_data(
@@ -441,12 +462,20 @@ class ProductToggleDashboard:
         self.current_product = self.product_names[0]
         self.available_days = sorted(self.filtered_prices["day"].dropna().astype(int).unique().tolist())
 
+        # Your algorithm's trades (from official logs)
+        self.your_trades = your_trades if your_trades is not None else pd.DataFrame()
+        self.pnl_series = pnl_series if pnl_series is not None else pd.DataFrame()
+        self.final_profit = final_profit
+        self.final_positions = final_positions or {}
+        self.has_official_data = not self.your_trades.empty
+
         self.layer_visibility = {
             "Bids": True,
             "Asks": True,
-            "Trades": True,
+            "Mkt": True,      # Market trades (shortened to fit)
+            "Yours": self.has_official_data,  # Your algo trades
             "Mid": True,
-            "Normalize": False,
+            "Norm": False,    # Normalize (shortened)
         }
         self.level_visibility = {1: True, 2: True, 3: True}
         self.day_visibility = {day: True for day in self.available_days}
@@ -490,13 +519,35 @@ class ProductToggleDashboard:
         self.spread_ax = self.figure.add_subplot(grid[1, 0])
         self.volume_ax = self.figure.add_subplot(grid[1, 1])
 
+        # Create abbreviated product labels for radio buttons
+        self.product_labels = [_abbrev_product(p) for p in self.product_names]
+        self.label_to_product = {_abbrev_product(p): p for p in self.product_names}
+
         radio_height = max(0.12, 0.055 * len(self.product_names))
         radio_ax = self.figure.add_axes([0.03, 0.74, 0.13, radio_height], facecolor="#f1f3f5")
-        self.radio = RadioButtons(radio_ax, self.product_names, active=0)
-        _set_checkbox_fontsize(self.radio, 10)
-        self.radio.on_clicked(self._on_product_selected)
+        self.radio = RadioButtons(radio_ax, self.product_labels, active=0)
+        _set_checkbox_fontsize(self.radio, 9)
+        self.radio.on_clicked(self._on_product_label_selected)
 
-        layer_ax = self.figure.add_axes([0.03, 0.48, 0.13, 0.17], facecolor="#f1f3f5")
+        # Pre-calculate per-product P&L from your trades
+        self.product_pnl = {}
+        if not self.your_trades.empty:
+            for product in self.product_names:
+                pt = self.your_trades[self.your_trades["product"] == product]
+                if pt.empty:
+                    self.product_pnl[product] = {"realized": 0.0, "net_qty": 0}
+                    continue
+                buys = pt[pt["your_side"] == "buy"]
+                sells = pt[pt["your_side"] == "sell"]
+                buy_cost = (buys["price"] * buys["quantity"]).sum()
+                sell_revenue = (sells["price"] * sells["quantity"]).sum()
+                net_qty = buys["quantity"].sum() - sells["quantity"].sum()
+                self.product_pnl[product] = {
+                    "realized": sell_revenue - buy_cost,
+                    "net_qty": int(self.final_positions.get(product, net_qty)),
+                }
+
+        layer_ax = self.figure.add_axes([0.03, 0.46, 0.13, 0.19], facecolor="#f1f3f5")
         self.layer_check = CheckButtons(layer_ax, list(self.layer_visibility.keys()), list(self.layer_visibility.values()))
         _set_checkbox_fontsize(self.layer_check, 9.5)
         self.layer_check.on_clicked(self._on_layer_toggled)
@@ -522,13 +573,17 @@ class ProductToggleDashboard:
         )
         self.trade_slider.on_changed(self._on_trade_filter_changed)
 
-        self.figure.text(0.03, 0.69, "Product", fontsize=11, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.65, "Layers", fontsize=11, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.445, "Depth levels", fontsize=11, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.295, "Days", fontsize=11, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.08, "Left/right arrows switch products.", fontsize=9, color="#495057")
-        self.figure.text(0.03, 0.055, "Normalize centers prices on quoted mid.", fontsize=9, color="#495057")
-        self.figure.text(0.23, 0.08, "Drag top chart to zoom time. Scroll zooms time. Shift+scroll zooms price. Double-click or press r to reset.", fontsize=9, color="#495057")
+        self.figure.text(0.03, 0.69, "Product", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.655, "Layers", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.445, "Depth", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.295, "Days", fontsize=10, weight="bold", color="#212529")
+
+        # Status line showing official log info if available
+        if self.has_official_data and self.final_profit is not None:
+            profit_color = "#16a34a" if self.final_profit >= 0 else "#dc2626"
+            self.figure.text(0.03, 0.025, f"Run P&L: {self.final_profit:+,.2f}", fontsize=10, weight="bold", color=profit_color)
+
+        self.figure.text(0.19, 0.055, "Arrows=product | Drag/scroll=zoom | Shift+scroll=price zoom | r=reset | Norm=center on mid", fontsize=8.5, color="#6b7280")
 
         self.figure.canvas.mpl_connect("key_press_event", self._on_key_press)
         self.figure.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
@@ -542,6 +597,11 @@ class ProductToggleDashboard:
         self.hover_hline = None
 
         self.render(self.current_product)
+
+    def _on_product_label_selected(self, label: str) -> None:
+        """Handle radio button click with abbreviated label."""
+        product = self.label_to_product.get(label, label)
+        self._on_product_selected(product)
 
     def _on_product_selected(self, product: str) -> None:
         self.price_zoom_scale = 1.0
@@ -649,7 +709,7 @@ class ProductToggleDashboard:
                     (self.current_ask_points["global_timestamp"] >= lower) & (self.current_ask_points["global_timestamp"] <= upper)
                 ]["display_price"]
             )
-        if self.layer_visibility["Trades"] and not self.current_trade_points.empty:
+        if self.layer_visibility["Mkt"] and not self.current_trade_points.empty:
             visible_series.append(
                 self.current_trade_points[
                     (self.current_trade_points["global_timestamp"] >= lower) & (self.current_trade_points["global_timestamp"] <= upper)
@@ -664,7 +724,7 @@ class ProductToggleDashboard:
         if combined.empty:
             return
 
-        if self.layer_visibility["Normalize"]:
+        if self.layer_visibility["Norm"]:
             center = 0.0
             base_half_width = max(8.0, float(combined.abs().quantile(0.998)) + 2.5)
         else:
@@ -786,7 +846,7 @@ class ProductToggleDashboard:
         product_trades: pd.DataFrame,
         product_volume: pd.DataFrame,
     ) -> None:
-        normalize = self.layer_visibility["Normalize"]
+        normalize = self.layer_visibility["Norm"]
         active_levels = {level for level, enabled in self.level_visibility.items() if enabled}
         if not active_levels:
             active_levels = {1}
@@ -859,7 +919,7 @@ class ProductToggleDashboard:
                 Line2D([0], [0], marker="s", linestyle="", color=QUOTE_COLORS["ask"], markersize=6, label="Ask quotes")
             )
 
-        if self.layer_visibility["Trades"] and not trade_points.empty:
+        if self.layer_visibility["Mkt"] and not trade_points.empty:
             trade_markers = {"buy": "^", "sell": "v", "neutral": "o"}
             for side in ("buy", "sell", "neutral"):
                 side_points = trade_points[trade_points["aggressor"] == side]
@@ -887,15 +947,59 @@ class ProductToggleDashboard:
                         markeredgecolor="white",
                         markeredgewidth=0.35,
                         markersize=7,
-                        label=f"{side.title()} trades",
+                        label=f"Mkt {side}",
                     )
                 )
 
-        self.price_ax.set_title(
-            f"{product} order book over time{' | normalized to quoted mid' if normalize else ''}",
-            fontsize=13,
-            pad=10,
-        )
+        # Your algorithm's trades (from official logs) - bright distinct markers
+        if self.layer_visibility["Yours"] and not self.your_trades.empty:
+            product_your_trades = self.your_trades[self.your_trades["product"] == product].copy()
+            if not product_your_trades.empty:
+                # Apply normalization if needed
+                if normalize:
+                    product_your_trades = product_your_trades.merge(
+                        product_prices[["global_timestamp", "quoted_mid_price"]].drop_duplicates("global_timestamp"),
+                        on="global_timestamp",
+                        how="left",
+                    )
+                    product_your_trades["display_price"] = product_your_trades["price"] - product_your_trades["quoted_mid_price"].fillna(product_your_trades["price"])
+                else:
+                    product_your_trades["display_price"] = product_your_trades["price"]
+
+                your_markers = {"buy": "^", "sell": "v"}
+                for side in ("buy", "sell"):
+                    side_trades = product_your_trades[product_your_trades["your_side"] == side]
+                    if side_trades.empty:
+                        continue
+                    sizes = np.clip(side_trades["quantity"].to_numpy(dtype=float) * 12.0, 60.0, 300.0)
+                    self.price_ax.scatter(
+                        side_trades["global_timestamp"],
+                        side_trades["display_price"],
+                        s=sizes,
+                        color=YOUR_TRADE_COLORS[side],
+                        alpha=0.95,
+                        marker=your_markers[side],
+                        edgecolors="#1f2937",
+                        linewidths=1.2,
+                        zorder=6,  # On top of everything
+                    )
+                    legend_handles.append(
+                        Line2D(
+                            [0],
+                            [0],
+                            marker=your_markers[side],
+                            linestyle="",
+                            markerfacecolor=YOUR_TRADE_COLORS[side],
+                            markeredgecolor="#1f2937",
+                            markeredgewidth=1.0,
+                            markersize=9,
+                            label=f"You {side}",
+                        )
+                    )
+
+        title_abbrev = _abbrev_product(product)
+        norm_suffix = " (normalized)" if normalize else ""
+        self.price_ax.set_title(f"{title_abbrev} order book{norm_suffix}", fontsize=12, pad=8)
         self.price_ax.set_ylabel("Price - quoted mid" if normalize else "Price")
         _apply_day_ticks(self.price_ax, product_prices)
         self.price_ax.set_xlabel("Round 1 timeline")
@@ -905,13 +1009,20 @@ class ProductToggleDashboard:
         valid_mid = clean_mid.dropna()
         valid_spread = product_prices["spread"].dropna()
         visible_volume = trade_points["quantity"].sum() if not trade_points.empty else 0
+
+        # Count your trades for this product
+        your_product_trades = self.your_trades[self.your_trades["product"] == product] if not self.your_trades.empty else pd.DataFrame()
+        your_buys = your_product_trades[your_product_trades["your_side"] == "buy"]["quantity"].sum() if not your_product_trades.empty else 0
+        your_sells = your_product_trades[your_product_trades["your_side"] == "sell"]["quantity"].sum() if not your_product_trades.empty else 0
+
         summary_lines = [
-            f"Last mid: {valid_mid.iloc[-1]:,.1f}" if not valid_mid.empty else "Last mid: n/a",
-            f"Median spread: {valid_spread.median():.1f}" if not valid_spread.empty else "Median spread: n/a",
-            f"Visible trades: {len(trade_points):,}",
-            f"Visible qty: {int(visible_volume):,}",
-            f"Levels: {', '.join(f'L{level}' for level in sorted(active_levels))}",
+            f"Mid: {valid_mid.iloc[-1]:,.1f}" if not valid_mid.empty else "Mid: n/a",
+            f"Spread: {valid_spread.median():.1f}" if not valid_spread.empty else "Spread: n/a",
+            f"Mkt trades: {len(trade_points):,}",
         ]
+        if not your_product_trades.empty:
+            summary_lines.append(f"You: +{int(your_buys)} / -{int(your_sells)}")
+        summary_lines.append(f"Levels: {','.join(f'L{l}' for l in sorted(active_levels))}")
         self.price_ax.text(
             0.99,
             0.98,
@@ -948,26 +1059,88 @@ class ProductToggleDashboard:
         self.spread_ax.set_ylabel("Spread")
         _style_axis(self.spread_ax, product_prices)
 
-        visible_trade_volume = aggregate_trade_volume(trade_points) if not trade_points.empty else pd.DataFrame()
-        bucketed_volume, bucket_width = _bucket_trade_volume(visible_trade_volume)
-        if bucketed_volume.empty:
-            self.volume_ax.text(0.5, 0.5, "No trades in filter", ha="center", va="center", transform=self.volume_ax.transAxes)
+        # P&L panel (if official data available) or Trade volume
+        if self.has_official_data and not self.pnl_series.empty:
+            # Filter P&L to selected days
+            selected_days = self._selected_days()
+            pnl_data = self.pnl_series[self.pnl_series["day"].isin(selected_days)].copy()
+
+            if not pnl_data.empty:
+                pnl_x = pnl_data["global_timestamp"].to_numpy()
+                pnl_y = pnl_data["pnl"].to_numpy()
+
+                # Color based on positive/negative
+                self.volume_ax.fill_between(
+                    pnl_x, 0, pnl_y,
+                    where=pnl_y >= 0,
+                    color="#16a34a",
+                    alpha=0.3,
+                    linewidth=0,
+                )
+                self.volume_ax.fill_between(
+                    pnl_x, 0, pnl_y,
+                    where=pnl_y < 0,
+                    color="#dc2626",
+                    alpha=0.3,
+                    linewidth=0,
+                )
+                self.volume_ax.plot(pnl_x, pnl_y, color=PNL_COLOR, linewidth=1.8, zorder=3)
+                self.volume_ax.axhline(0, color="#6b7280", linewidth=0.8, linestyle="--", alpha=0.5)
+
+                # Per-product P&L annotation
+                product_pnl_info = self.product_pnl.get(product, {})
+                realized = product_pnl_info.get("realized", 0)
+                net_qty = product_pnl_info.get("net_qty", 0)
+                color = "#16a34a" if realized >= 0 else "#dc2626"
+
+                abbrev = _abbrev_product(product)
+                self.volume_ax.text(
+                    0.98, 0.95,
+                    f"{abbrev}: {realized:+,.0f}\nPos: {net_qty:+d}",
+                    transform=self.volume_ax.transAxes,
+                    ha="right", va="top",
+                    fontsize=9, weight="bold", color=color,
+                    bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#dee2e6", "alpha": 0.9},
+                )
+
+                # Total P&L in corner
+                if self.final_profit is not None:
+                    total_color = "#16a34a" if self.final_profit >= 0 else "#dc2626"
+                    self.volume_ax.text(
+                        0.02, 0.95,
+                        f"Total: {self.final_profit:+,.0f}",
+                        transform=self.volume_ax.transAxes,
+                        ha="left", va="top",
+                        fontsize=9, color=total_color,
+                    )
+
+                self.volume_ax.set_title("P&L (Your Run)")
+                self.volume_ax.set_ylabel("Profit")
+            else:
+                self.volume_ax.text(0.5, 0.5, "P&L: Select Day 1", ha="center", va="center", transform=self.volume_ax.transAxes, color="#6b7280")
+                self.volume_ax.set_title("P&L")
         else:
-            bar_colors = np.where(
-                bucketed_volume["signed_quantity"] > 0,
-                SIDE_COLORS["buy"],
-                np.where(bucketed_volume["signed_quantity"] < 0, SIDE_COLORS["sell"], SIDE_COLORS["neutral"]),
-            )
-            self.volume_ax.bar(
-                bucketed_volume["bucket_timestamp"],
-                bucketed_volume["traded_quantity"],
-                color=bar_colors,
-                width=bucket_width * 0.86,
-                alpha=0.9,
-                edgecolor="none",
-            )
-        self.volume_ax.set_title("Trade volume")
-        self.volume_ax.set_ylabel("Quantity")
+            # Fallback to trade volume
+            visible_trade_volume = aggregate_trade_volume(trade_points) if not trade_points.empty else pd.DataFrame()
+            bucketed_volume, bucket_width = _bucket_trade_volume(visible_trade_volume)
+            if bucketed_volume.empty:
+                self.volume_ax.text(0.5, 0.5, "No trades in filter", ha="center", va="center", transform=self.volume_ax.transAxes)
+            else:
+                bar_colors = np.where(
+                    bucketed_volume["signed_quantity"] > 0,
+                    SIDE_COLORS["buy"],
+                    np.where(bucketed_volume["signed_quantity"] < 0, SIDE_COLORS["sell"], SIDE_COLORS["neutral"]),
+                )
+                self.volume_ax.bar(
+                    bucketed_volume["bucket_timestamp"],
+                    bucketed_volume["traded_quantity"],
+                    color=bar_colors,
+                    width=bucket_width * 0.86,
+                    alpha=0.9,
+                    edgecolor="none",
+                )
+            self.volume_ax.set_title("Trade volume")
+            self.volume_ax.set_ylabel("Quantity")
         _style_axis(self.volume_ax, product_prices)
 
         self.hover_vline = Line2D([], [], color="#495057", linestyle="--", linewidth=0.8, alpha=0.7, visible=False, zorder=5)
@@ -1015,7 +1188,8 @@ class ProductToggleDashboard:
         ].sort_values("global_timestamp")
 
         self._draw_orderbook_explorer(product, product_prices, product_trades, product_volume)
-        self.figure.suptitle(f"IMC Prosperity 4 Round 1 order-book explorer | {product}", fontsize=16, y=0.975)
+        abbrev = _abbrev_product(product)
+        self.figure.suptitle(f"IMC Prosperity 4 | {abbrev}", fontsize=15, y=0.975)
         self._apply_time_window()
         self.figure.canvas.draw_idle()
 
@@ -1025,5 +1199,18 @@ def launch_interactive_dashboard(
     trades: pd.DataFrame | None = None,
     products: Sequence[str] | None = None,
     days: Sequence[int] | None = None,
+    your_trades: pd.DataFrame | None = None,
+    pnl_series: pd.DataFrame | None = None,
+    final_profit: float | None = None,
+    final_positions: dict[str, int] | None = None,
 ) -> ProductToggleDashboard:
-    return ProductToggleDashboard(prices, trades, products=products, days=days)
+    return ProductToggleDashboard(
+        prices,
+        trades,
+        products=products,
+        days=days,
+        your_trades=your_trades,
+        pnl_series=pnl_series,
+        final_profit=final_profit,
+        final_positions=final_positions,
+    )
