@@ -87,6 +87,58 @@ def _write_figure(figure, output_path: Path | None, show: bool) -> None:
     plt.close(figure)
 
 
+def _align_time_to_prices(frame: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    aligned = frame.copy()
+    if aligned.empty:
+        return aligned
+
+    day_values = sorted(prices["day"].dropna().astype(int).unique().tolist())
+    day_order = {day: idx for idx, day in enumerate(day_values)}
+    day_span = int(prices.groupby("day")["timestamp"].max().max()) + 100
+
+    aligned["day_sequence"] = aligned["day"].map(day_order).astype(int)
+    aligned["global_timestamp"] = aligned["day_sequence"] * day_span + aligned["timestamp"]
+    aligned["day_label"] = aligned["day"].map(lambda day: f"Day {day}")
+    return aligned
+
+
+def _final_position_map(log_data: dict) -> dict[str, int]:
+    return {
+        row["symbol"]: int(row["quantity"])
+        for row in log_data.get("final_positions", [])
+        if row.get("symbol") != "XIRECS"
+    }
+
+
+def _build_official_run_payload(base_prices: pd.DataFrame, run_dir: Path, run_day: int = 1) -> dict:
+    log_data = load_official_log(run_dir, run_day=run_day)
+
+    merged_prices = base_prices.copy()
+    run_prices = log_data.get("run_prices")
+    if run_prices is not None and not run_prices.empty:
+        merged_prices = pd.concat([merged_prices, run_prices], ignore_index=True, sort=False)
+        merged_prices = recalculate_time_columns(merged_prices)
+        merged_prices = merged_prices.sort_values(["product", "day", "timestamp"]).reset_index(drop=True)
+
+    your_trades = log_data.get("your_trades", pd.DataFrame()).copy()
+    pnl_series = log_data.get("pnl_series", pd.DataFrame()).copy()
+    if not your_trades.empty:
+        your_trades = _align_time_to_prices(your_trades, merged_prices)
+    if not pnl_series.empty:
+        pnl_series = _align_time_to_prices(pnl_series, merged_prices)
+
+    return {
+        "name": run_dir.name,
+        "prices": merged_prices,
+        "your_trades": your_trades,
+        "pnl_series": pnl_series,
+        "final_profit": log_data.get("final_profit"),
+        "final_positions": _final_position_map(log_data),
+        "status": log_data.get("status", "UNKNOWN"),
+        "run_prices_count": 0 if run_prices is None else len(run_prices),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -95,63 +147,29 @@ def main(argv: list[str] | None = None) -> int:
     prices, trades = load_round1_data(args.root)
 
     if command == "dashboard":
-        # Load official logs if available
-        your_trades = None
-        pnl_series = None
-        final_profit = None
-        final_positions = None
+        official_runs = {}
+        selected_run_name = None
 
         logs_root = args.logs if args.logs else DEFAULT_LOGS_ROOT
         if Path(logs_root).exists():
             run_dirs = discover_official_logs(logs_root)
             if run_dirs:
-                # Use specified run or latest
+                for run_dir in run_dirs:
+                    official_runs[run_dir.name] = _build_official_run_payload(prices, run_dir, run_day=1)
+
                 if args.run:
-                    matching = [r for r in run_dirs if args.run in r.name]
-                    run_dir = matching[0] if matching else run_dirs[-1]
+                    matching = [name for name in official_runs if args.run in name]
+                    selected_run_name = matching[0] if matching else run_dirs[-1].name
                 else:
-                    run_dir = run_dirs[-1]  # Latest run
+                    selected_run_name = run_dirs[-1].name
 
-                # Assign run as Day 1 (after DataCapsules Day 0)
-                run_day = 1
-                print(f"Loading official logs from: {run_dir.name} (as Day {run_day})")
-                log_data = load_official_log(run_dir, run_day=run_day)
-
-                your_trades = log_data["your_trades"]
-                pnl_series = log_data["pnl_series"]
-                final_profit = log_data["final_profit"]
-                final_positions = {
-                    row["symbol"]: int(row["quantity"])
-                    for row in log_data.get("final_positions", [])
-                    if row.get("symbol") != "XIRECS"
-                }
-
-                # Merge run prices with DataCapsules prices
-                run_prices = log_data.get("run_prices")
-                if run_prices is not None and not run_prices.empty:
-                    prices = pd.concat([prices, run_prices], ignore_index=True)
-                    # Recalculate global timestamps now that all days are present
-                    prices = recalculate_time_columns(prices)
-                    prices = prices.sort_values(["product", "day", "timestamp"]).reset_index(drop=True)
-                    print(f"  Added {len(run_prices)} price rows as Day {run_day}")
-
-                # Recalculate timestamps using the same day mapping as prices
-                day_values = sorted(prices["day"].unique().tolist())
-                day_order = {day: idx for idx, day in enumerate(day_values)}
-                tick_size = 100  # Standard tick size
-                day_span = int(prices.groupby("day")["timestamp"].max().max()) + tick_size
-
-                if not your_trades.empty:
-                    your_trades["day_sequence"] = your_trades["day"].map(day_order).astype(int)
-                    your_trades["global_timestamp"] = your_trades["day_sequence"] * day_span + your_trades["timestamp"]
-                    your_trades["day_label"] = your_trades["day"].map(lambda d: f"Day {d}")
-
-                if not pnl_series.empty:
-                    pnl_series["day_sequence"] = pnl_series["day"].map(day_order).astype(int)
-                    pnl_series["global_timestamp"] = pnl_series["day_sequence"] * day_span + pnl_series["timestamp"]
-                    pnl_series["day_label"] = pnl_series["day"].map(lambda d: f"Day {d}")
-
-                print(f"  Status: {log_data['status']}, P&L: {final_profit:+,.2f}, Your trades: {len(your_trades)}")
+                selected = official_runs[selected_run_name]
+                print(f"Loaded {len(official_runs)} official run folder(s). Selected: {selected_run_name} (as Day 1)")
+                print(
+                    f"  Added {selected['run_prices_count']} price rows | "
+                    f"Status: {selected['status']}, P&L: {selected['final_profit']:+,.2f}, "
+                    f"Your trades: {len(selected['your_trades'])}"
+                )
 
         if args.show:
             controller = launch_interactive_dashboard(
@@ -159,10 +177,8 @@ def main(argv: list[str] | None = None) -> int:
                 trades,
                 products=args.products,
                 days=args.days,
-                your_trades=your_trades,
-                pnl_series=pnl_series,
-                final_profit=final_profit,
-                final_positions=final_positions,
+                official_runs=official_runs,
+                selected_run=selected_run_name,
             )
             plt.show()
             plt.close(controller.figure)

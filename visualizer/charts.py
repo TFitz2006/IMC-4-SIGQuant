@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.widgets import CheckButtons, RadioButtons, SpanSelector
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.widgets import Button, CheckButtons, RadioButtons, SpanSelector
 
 from visualizer.analytics import PRICE_LEVELS, add_order_book_features, aggregate_trade_volume, infer_trade_aggressor
 
@@ -45,6 +46,11 @@ PRODUCT_ABBREV = {
 def _abbrev_product(name: str) -> str:
     """Shorten product name for display."""
     return PRODUCT_ABBREV.get(name, name[:10])
+
+
+def _abbrev_run_name(name: str) -> str:
+    """Shorten official run folder names for the left-side selector."""
+    return name.replace("Run", "R").replace("(", " ").replace(")", "")
 
 
 def _ensure_list(values: Sequence[str | int] | None) -> list[str | int] | None:
@@ -93,6 +99,7 @@ def _day_boundaries(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.groupby("day", as_index=False).agg(
         min_timestamp=("global_timestamp", "min"),
         max_timestamp=("global_timestamp", "max"),
+        day_sequence=("day_sequence", "min"),
     )
 
 
@@ -108,6 +115,39 @@ def _apply_day_ticks(ax, frame: pd.DataFrame) -> None:
 
     for start in boundaries["min_timestamp"].tolist()[1:]:
         ax.axvline(start, color="#adb5bd", linestyle="--", linewidth=0.8, alpha=0.8, zorder=1)
+
+
+def _apply_timestamp_ticks(ax, frame: pd.DataFrame) -> None:
+    if frame.empty:
+        return
+
+    boundaries = _day_boundaries(frame).sort_values("day_sequence").reset_index(drop=True)
+    if boundaries.empty:
+        return
+
+    start_values = boundaries["min_timestamp"].to_numpy(dtype=float)
+    end_values = boundaries["max_timestamp"].to_numpy(dtype=float)
+    local_starts = (
+        frame.groupby("day", as_index=False)
+        .agg(local_min_timestamp=("timestamp", "min"))
+        .merge(boundaries[["day", "min_timestamp"]], on="day", how="right")
+        .sort_values("min_timestamp")
+        ["local_min_timestamp"]
+        .fillna(0)
+        .to_numpy(dtype=float)
+    )
+
+    def _formatter(x_value: float, _position: int) -> str:
+        index = int(np.searchsorted(start_values, x_value, side="right") - 1)
+        index = min(max(index, 0), len(start_values) - 1)
+        if x_value > end_values[index] and index < len(start_values) - 1:
+            index += 1
+        local_timestamp = int(round(x_value - start_values[index] + local_starts[index]))
+        return f"{local_timestamp}"
+
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=4))
+    ax.xaxis.set_major_formatter(FuncFormatter(_formatter))
+    ax.tick_params(axis="x", labelsize=8)
 
 
 def _shade_days(ax, frame: pd.DataFrame) -> None:
@@ -135,9 +175,17 @@ def _smooth_mid_price(frame: pd.DataFrame, window: int = 41) -> pd.Series:
     )
 
 
-def _style_axis(ax, frame: pd.DataFrame, xlabel: str = "Round 1 timeline") -> None:
+def _style_axis(
+    ax,
+    frame: pd.DataFrame,
+    xlabel: str = "Round 1 timeline",
+    timestamp_ticks: bool = False,
+) -> None:
     _shade_days(ax, frame)
-    _apply_day_ticks(ax, frame)
+    if timestamp_ticks:
+        _apply_timestamp_ticks(ax, frame)
+    else:
+        _apply_day_ticks(ax, frame)
     ax.set_xlabel(xlabel)
     ax.grid(alpha=0.22, color="#dbe2ea")
     ax.margins(x=0.01)
@@ -284,8 +332,9 @@ def _draw_summary_panel(
     volume_ax.set_title("Trade volume")
     volume_ax.set_ylabel("Quantity")
 
-    for axis in (price_ax, spread_ax, volume_ax):
-        _style_axis(axis, product_prices)
+    _style_axis(price_ax, product_prices, xlabel="Timestamp", timestamp_ticks=True)
+    _style_axis(spread_ax, product_prices)
+    _style_axis(volume_ax, product_prices)
 
     handles, labels = price_ax.get_legend_handles_labels()
     deduped: dict[str, object] = {}
@@ -463,23 +512,24 @@ class ProductToggleDashboard:
         pnl_series: pd.DataFrame | None = None,
         final_profit: float | None = None,
         final_positions: dict[str, int] | None = None,
+        official_runs: dict[str, dict] | None = None,
+        selected_run: str | None = None,
     ) -> None:
         plt.style.use("seaborn-v0_8-whitegrid")
-        self.filtered_prices, self.filtered_trades, self.trade_volume, self.product_names = _prepare_dashboard_data(
-            prices,
-            trades,
-            products,
-            days,
-        )
-        self.current_product = self.product_names[0]
-        self.available_days = sorted(self.filtered_prices["day"].dropna().astype(int).unique().tolist())
-
-        # Your algorithm's trades (from official logs)
-        self.your_trades = your_trades if your_trades is not None else pd.DataFrame()
-        self.pnl_series = pnl_series if pnl_series is not None else pd.DataFrame()
-        self.final_profit = final_profit
-        self.final_positions = final_positions or {}
-        self.has_official_data = not self.your_trades.empty
+        self.base_prices = prices.copy()
+        self.base_trades = trades.copy() if trades is not None else pd.DataFrame()
+        self.products_filter = products
+        self.days_filter = days
+        self.official_runs = official_runs or {}
+        self.run_names = list(self.official_runs.keys())
+        self.selected_run = selected_run if selected_run in self.official_runs else (self.run_names[-1] if self.run_names else None)
+        self.standalone_official = {
+            "your_trades": your_trades if your_trades is not None else pd.DataFrame(),
+            "pnl_series": pnl_series if pnl_series is not None else pd.DataFrame(),
+            "final_profit": final_profit,
+            "final_positions": final_positions or {},
+        }
+        self._set_data_state()
 
         self.layer_visibility = {
             "Bids": True,
@@ -498,7 +548,7 @@ class ProductToggleDashboard:
             min_qty = float(self.filtered_trades["quantity"].min())
             max_qty = float(self.filtered_trades["quantity"].max())
             self.trade_quantity_range = (min_qty, max_qty)
-        self.trade_quantity_bounds = (min_qty, max_qty)
+            self.trade_quantity_bounds = (min_qty, max_qty)
         self.full_time_bounds = (
             float(self.filtered_prices["global_timestamp"].min()),
             float(self.filtered_prices["global_timestamp"].max()),
@@ -536,54 +586,58 @@ class ProductToggleDashboard:
         self.product_labels = [_abbrev_product(p) for p in self.product_names]
         self.label_to_product = {_abbrev_product(p): p for p in self.product_names}
 
-        radio_height = max(0.12, 0.055 * len(self.product_names))
-        radio_ax = self.figure.add_axes([0.03, 0.74, 0.13, radio_height], facecolor="#f1f3f5")
+        radio_height = max(0.09, 0.045 * len(self.product_names))
+        radio_ax = self.figure.add_axes([0.03, 0.80, 0.13, radio_height], facecolor="#f1f3f5")
         self.radio = RadioButtons(radio_ax, self.product_labels, active=0)
         _set_checkbox_fontsize(self.radio, 9)
         self.radio.on_clicked(self._on_product_label_selected)
 
-        # Pre-calculate per-product P&L from your trades
-        self.product_pnl = {}
-        if not self.your_trades.empty:
-            for product in self.product_names:
-                pt = self.your_trades[self.your_trades["product"] == product]
-                if pt.empty:
-                    self.product_pnl[product] = {"realized": 0.0, "net_qty": 0}
-                    continue
-                buys = pt[pt["your_side"] == "buy"]
-                sells = pt[pt["your_side"] == "sell"]
-                buy_cost = (buys["price"] * buys["quantity"]).sum()
-                sell_revenue = (sells["price"] * sells["quantity"]).sum()
-                net_qty = buys["quantity"].sum() - sells["quantity"].sum()
-                self.product_pnl[product] = {
-                    "realized": sell_revenue - buy_cost,
-                    "net_qty": int(self.final_positions.get(product, net_qty)),
-                }
+        self.run_dropdown_open = False
+        self.run_button = None
+        self.run_option_buttons: list[Button] = []
+        self.run_option_axes = []
+        if len(self.run_names) > 1:
+            run_button_ax = self.figure.add_axes([0.03, 0.69, 0.13, 0.035], facecolor="#f8f9fa")
+            self.run_button = Button(run_button_ax, _abbrev_run_name(self.selected_run or self.run_names[-1]))
+            self.run_button.label.set_fontsize(8.5)
+            self.run_button.on_clicked(self._toggle_run_dropdown)
 
-        layer_ax = self.figure.add_axes([0.03, 0.46, 0.13, 0.19], facecolor="#f1f3f5")
+            for index, run_name in enumerate(self.run_names):
+                option_ax = self.figure.add_axes([0.03, 0.65 - index * 0.036, 0.13, 0.034], facecolor="#ffffff")
+                option_button = Button(option_ax, _abbrev_run_name(run_name))
+                option_button.label.set_fontsize(8.2)
+                option_button.on_clicked(lambda _event, selected=run_name: self._select_run_name(selected))
+                option_ax.set_visible(False)
+                self.run_option_axes.append(option_ax)
+                self.run_option_buttons.append(option_button)
+
+        self.product_pnl = self._calculate_product_pnl()
+
+        layer_ax = self.figure.add_axes([0.03, 0.42, 0.13, 0.18], facecolor="#f1f3f5")
         self.layer_check = CheckButtons(layer_ax, list(self.layer_visibility.keys()), list(self.layer_visibility.values()))
         _set_checkbox_fontsize(self.layer_check, 9.5)
         self.layer_check.on_clicked(self._on_layer_toggled)
 
-        level_ax = self.figure.add_axes([0.03, 0.32, 0.13, 0.12], facecolor="#f1f3f5")
+        level_ax = self.figure.add_axes([0.03, 0.27, 0.13, 0.12], facecolor="#f1f3f5")
         self.level_check = CheckButtons(level_ax, [f"L{level}" for level in PRICE_LEVELS], [True, True, True])
         _set_checkbox_fontsize(self.level_check, 9.5)
         self.level_check.on_clicked(self._on_level_toggled)
 
         day_labels = [f"D{day}" for day in self.available_days]
-        day_ax = self.figure.add_axes([0.03, 0.18, 0.13, 0.10], facecolor="#f1f3f5")
+        day_ax = self.figure.add_axes([0.03, 0.13, 0.13, 0.11], facecolor="#f1f3f5")
         self.day_check = CheckButtons(day_ax, day_labels, [True for _ in self.available_days])
         _set_checkbox_fontsize(self.day_check, 9.5)
         self.day_check.on_clicked(self._on_day_toggled)
 
-        self.figure.text(0.03, 0.69, "Product", fontsize=10, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.655, "Layers", fontsize=10, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.445, "Depth", fontsize=10, weight="bold", color="#212529")
-        self.figure.text(0.03, 0.295, "Days", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.895, "Product", fontsize=10, weight="bold", color="#212529")
+        if len(self.run_names) > 1:
+            self.figure.text(0.03, 0.735, "Run", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.615, "Layers", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.395, "Depth", fontsize=10, weight="bold", color="#212529")
+        self.figure.text(0.03, 0.245, "Days", fontsize=10, weight="bold", color="#212529")
 
-        if self.has_official_data and self.final_profit is not None:
-            profit_color = "#16a34a" if self.final_profit >= 0 else "#dc2626"
-            self.figure.text(0.03, 0.025, f"Run P&L: {self.final_profit:+,.2f}", fontsize=10, weight="bold", color=profit_color)
+        self.run_pnl_text = self.figure.text(0.03, 0.025, "", fontsize=10, weight="bold")
+        self._update_run_pnl_text()
 
         self.figure.text(0.19, 0.055, "Arrows=product | Drag/scroll=zoom | Shift+scroll=price zoom | r=reset | Norm=center on mid", fontsize=8.5, color="#6b7280")
 
@@ -599,6 +653,79 @@ class ProductToggleDashboard:
         self.hover_hline = None
 
         self.render(self.current_product)
+
+    def _active_payload(self) -> dict:
+        if self.selected_run and self.selected_run in self.official_runs:
+            return self.official_runs[self.selected_run]
+        return {
+            "prices": self.base_prices,
+            "your_trades": self.standalone_official["your_trades"],
+            "pnl_series": self.standalone_official["pnl_series"],
+            "final_profit": self.standalone_official["final_profit"],
+            "final_positions": self.standalone_official["final_positions"],
+        }
+
+    def _set_data_state(self) -> None:
+        payload = self._active_payload()
+        active_prices = payload.get("prices", self.base_prices)
+        self.filtered_prices, self.filtered_trades, self.trade_volume, self.product_names = _prepare_dashboard_data(
+            active_prices,
+            self.base_trades,
+            self.products_filter,
+            self.days_filter,
+        )
+        previous_product = getattr(self, "current_product", None)
+        self.current_product = previous_product if previous_product in self.product_names else self.product_names[0]
+        self.available_days = sorted(self.filtered_prices["day"].dropna().astype(int).unique().tolist())
+
+        self.your_trades = payload.get("your_trades", pd.DataFrame())
+        self.pnl_series = payload.get("pnl_series", pd.DataFrame())
+        self.final_profit = payload.get("final_profit")
+        self.final_positions = payload.get("final_positions", {}) or {}
+        self.has_official_data = not self.your_trades.empty
+        self.product_pnl = self._calculate_product_pnl()
+
+        self.full_time_bounds = (
+            float(self.filtered_prices["global_timestamp"].min()),
+            float(self.filtered_prices["global_timestamp"].max()),
+        )
+
+        old_visibility = getattr(self, "day_visibility", {})
+        self.day_visibility = {day: old_visibility.get(day, True) for day in self.available_days}
+        if not any(self.day_visibility.values()):
+            self.day_visibility = {day: True for day in self.available_days}
+
+    def _calculate_product_pnl(self) -> dict[str, dict[str, float | int]]:
+        product_pnl = {}
+        if self.your_trades.empty:
+            return product_pnl
+
+        for product in self.product_names:
+            pt = self.your_trades[self.your_trades["product"] == product]
+            if pt.empty:
+                product_pnl[product] = {"realized": 0.0, "net_qty": 0}
+                continue
+            buys = pt[pt["your_side"] == "buy"]
+            sells = pt[pt["your_side"] == "sell"]
+            buy_cost = (buys["price"] * buys["quantity"]).sum()
+            sell_revenue = (sells["price"] * sells["quantity"]).sum()
+            net_qty = buys["quantity"].sum() - sells["quantity"].sum()
+            product_pnl[product] = {
+                "realized": sell_revenue - buy_cost,
+                "net_qty": int(self.final_positions.get(product, net_qty)),
+            }
+        return product_pnl
+
+    def _update_run_pnl_text(self) -> None:
+        if not hasattr(self, "run_pnl_text"):
+            return
+        if not self.has_official_data or self.final_profit is None:
+            self.run_pnl_text.set_text("")
+            return
+        profit_color = "#16a34a" if self.final_profit >= 0 else "#dc2626"
+        run_label = _abbrev_run_name(self.selected_run) if self.selected_run else "Run"
+        self.run_pnl_text.set_text(f"{run_label} P&L: {self.final_profit:+,.2f}")
+        self.run_pnl_text.set_color(profit_color)
 
     def _build_position_table_rows(self, product: str, product_prices: pd.DataFrame) -> list[list[str]]:
         if self.your_trades.empty:
@@ -655,6 +782,32 @@ class ProductToggleDashboard:
         """Handle radio button click with abbreviated label."""
         product = self.label_to_product.get(label, label)
         self._on_product_selected(product)
+
+    def _set_run_dropdown_visible(self, visible: bool) -> None:
+        self.run_dropdown_open = visible
+        for axis in self.run_option_axes:
+            axis.set_visible(visible)
+        self.figure.canvas.draw_idle()
+
+    def _toggle_run_dropdown(self, _event) -> None:
+        self._set_run_dropdown_visible(not self.run_dropdown_open)
+
+    def _select_run_name(self, run_name: str) -> None:
+        self._set_run_dropdown_visible(False)
+        if run_name == self.selected_run:
+            return
+
+        self.selected_run = run_name
+        if self.run_button is not None:
+            self.run_button.label.set_text(_abbrev_run_name(run_name))
+        previous_yours_visibility = self.layer_visibility.get("Yours", True)
+        self._set_data_state()
+        self.layer_visibility["Yours"] = previous_yours_visibility and self.has_official_data
+        self._reset_time_window_to_selected_days()
+        self.price_zoom_scale = 1.0
+        self._update_run_pnl_text()
+        self._hide_hover()
+        self.render(self.current_product)
 
     def _on_product_selected(self, product: str) -> None:
         self.price_zoom_scale = 1.0
@@ -1054,8 +1207,8 @@ class ProductToggleDashboard:
         norm_suffix = " (normalized)" if normalize else ""
         self.price_ax.set_title(f"{title_abbrev} order book{norm_suffix}", fontsize=12, pad=8)
         self.price_ax.set_ylabel("Price - quoted mid" if normalize else "Price")
-        _apply_day_ticks(self.price_ax, product_prices)
-        self.price_ax.set_xlabel("Round 1 timeline")
+        _apply_timestamp_ticks(self.price_ax, product_prices)
+        self.price_ax.set_xlabel("Timestamp")
         self.price_ax.grid(alpha=0.18, color="#dbe2ea")
         self.price_ax.margins(x=0.01)
 
@@ -1302,7 +1455,8 @@ class ProductToggleDashboard:
 
         self._draw_orderbook_explorer(product, product_prices, product_trades, product_volume)
         abbrev = _abbrev_product(product)
-        self.figure.suptitle(f"IMC Prosperity 4 | {abbrev}", fontsize=15, y=0.975)
+        run_suffix = f" | {_abbrev_run_name(self.selected_run)}" if self.selected_run else ""
+        self.figure.suptitle(f"IMC Prosperity 4 | {abbrev}{run_suffix}", fontsize=15, y=0.975)
         self._apply_time_window()
         self.figure.canvas.draw_idle()
 
@@ -1316,6 +1470,8 @@ def launch_interactive_dashboard(
     pnl_series: pd.DataFrame | None = None,
     final_profit: float | None = None,
     final_positions: dict[str, int] | None = None,
+    official_runs: dict[str, dict] | None = None,
+    selected_run: str | None = None,
 ) -> ProductToggleDashboard:
     return ProductToggleDashboard(
         prices,
@@ -1326,4 +1482,6 @@ def launch_interactive_dashboard(
         pnl_series=pnl_series,
         final_profit=final_profit,
         final_positions=final_positions,
+        official_runs=official_runs,
+        selected_run=selected_run,
     )

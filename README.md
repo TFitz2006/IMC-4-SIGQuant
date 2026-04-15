@@ -15,6 +15,7 @@ The goal is to support fast strategy development, debugging, and collaboration d
 - **Trading strategy scaffold** in `trading.py` with product-specific logic.
 - **Interactive visualizer** built with `matplotlib` and `pandas` to inspect market behavior.
 - **Round 1 data bundle** with three days of prices and trades.
+- **Official run overlays** from `OfficialLogs/` showing your trades, official P&L, and position summaries.
 - **Reference strategy file** from last year (`frankfurtHedgeHogs_imc3.py`) for idea generation.
 - **Internal planning notes** in `PROJECT_OVERVIEW.md`.
 
@@ -28,6 +29,7 @@ The goal is to support fast strategy development, debugging, and collaboration d
 │   └── ROUND1/
 ├── OfficialLogs/
 │   └── Run1(137859)/
+│   └── Run2(140028)/
 ├── PROJECT_OVERVIEW.md
 ├── frankfurtHedgeHogs_imc3.py
 └── README.md
@@ -46,6 +48,7 @@ Use this dataset with the visualizer and strategy development workflow to valida
 The visualizer (`visualizer/`) is a custom `matplotlib` + `pandas` dashboard for one-product-at-a-time market inspection. It supports:
 
 - toggling products,
+- toggling official run folders loaded from `OfficialLogs/`,
 - toggling order book depth levels,
 - toggling days,
 - inspecting trades,
@@ -62,8 +65,10 @@ python3 -m visualizer.main dashboard --show
 Use the official submission logs in `OfficialLogs/` to add your own trades, the official run order book, and the P&L/position summary:
 
 ```bash
-python3 -m visualizer.main dashboard --show --logs OfficialLogs --run "Run1(137859)"
+python3 -m visualizer.main dashboard --show --logs OfficialLogs --run "Run2(140028)"
 ```
+
+If multiple folders exist under `OfficialLogs/`, the live dashboard adds a `Run` dropdown selector on the left. Each folder is treated as one paired official run, so switching `R1 137859` or `R2 140028` swaps the matching `.json` and `.log` data together.
 
 ### Snapshot View
 
@@ -78,6 +83,7 @@ python3 -m visualizer.main snapshot --product ASH_COATED_OSMIUM --day 0 --timest
 Inside the live dashboard:
 
 - use the radio buttons or left/right arrow keys to switch products
+- use the `Run` dropdown to switch official run folders
 - use the `Layers`, `Depth`, and `Days` toggles on the left
 - drag on the top chart to zoom time
 - scroll to zoom time
@@ -95,6 +101,13 @@ Current implemented logic:
   Drift-aware market making with an upward-trending fair value.
 
 Both are structured for iterative extension as more products and signals are added.
+
+Experimental strategy copies:
+
+- `trading_experiment.py`: first experimental variant tested as `Run2(140028)`.
+- `trading_experiment_v2.py`: current scratch copy for the next strategy iteration.
+
+Run 2 improved official P&L from `+4,392.31` to `+6,058.03`, but the improvement mostly came from carrying a larger final `PEPPER` inventory (`+44`) rather than cleaner PEPPER cashflow. The next strategy focus should be capping PEPPER inventory while preserving the improved buy discipline.
 
 ## Setup / Installation
 
